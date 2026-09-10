@@ -56,5 +56,13 @@
     "resolution": [1200, 1600],
     "storage": "SD (SPI) + Internal flash",
     "url": "https://www.seeedstudio.com/reTerminal-E1004-p-6692.html"
+  },
+  {
+    "id": "gooddisplay_esp32_133c02",
+    "label": "Good Display ESP32-133C02",
+    "display": "7.09\" 6-color",
+    "resolution": [1200, 1600],
+    "storage": "Internal flash",
+    "url": "https://www.good-display.com/product/574.html"
   }
 ]

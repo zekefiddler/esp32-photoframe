@@ -3,3 +3,13 @@ config EP_DRIVER_ED2208_NCA
     help
         Driver for 13.3 inch Spectra 6 E-Paper displays (compatible with SeeedStudio T133A01,
         as used on the XIAO EE02 and reTerminal E1004).
+
+config EP_ED2208_NCA_PANEL_GDEB0709E01
+    bool "Panel is Good Display GDEB0709E01 (7.09\" 1200x1600)"
+    depends on EP_DRIVER_ED2208_NCA
+    default n
+    help
+        Use Good Display's GDEB0709E01 tuning instead of the Seeed T133A01 table:
+        different PSR, analog timing, booster, DRF and POF values, plus the
+        DCDC, PLL, per-controller POFS and CMDA4 commands the vendor init sends.
+        Same controller family and command flow; only the parameters change.

@@ -25,19 +25,37 @@ static esp_pm_lock_handle_t pm_lock = NULL;
 // Packed pixel buffer size: 2 pixels per byte (4-bit color depth)
 #define EPD_BUF_SIZE (EPD_WIDTH / 2 * EPD_HEIGHT)
 
-// --- Initialization Data (from T133A01_Defines.h) ---
+// --- Initialization Data ---
+// Two panels share this controller family and command flow but not their tuning.
+// Seeed T133A01 values come from T133A01_Defines.h; Good Display GDEB0709E01
+// values come from the vendor's GDEB0709E01 ESP32 code example (2026-08).
+#if CONFIG_EP_ED2208_NCA_PANEL_GDEB0709E01
+static const uint8_t PSR_V[] = {0xDF, 0x6B};
+static const uint8_t POF_V[] = {0x01};
+static const uint8_t DRF_V[] = {0x00};
+static const uint8_t BTST_P_V[] = {0xE0, 0x20};
+static const uint8_t BTST_N_V[] = {0xE0, 0x20};
+static const uint8_t r74DataBuf[] = {0x00, 0x0C, 0x0C, 0xD9, 0xDD, 0xDD, 0x15, 0x15, 0x55};
+// Commands the GDEB0709E01 init sends that the T133A01 init does not.
+static const uint8_t DCDC_V[] = {0x44, 0x54, 0x00};
+static const uint8_t PLL_V[] = {0x08};
+static const uint8_t POFS_M_V[] = {0x00, 0xC0, 0x03, 0xA8};  // master (left) controller
+static const uint8_t POFS_S_V[] = {0x00, 0xC0, 0x03, 0x9A};  // slave (right) controller
+static const uint8_t CMDA4_V[] = {0x03, 0x00, 0x01, 0x03, 0x00, 0x03, 0x00, 0x00, 0x00};
+#else
 static const uint8_t PSR_V[] = {0xDF, 0x69};
-static const uint8_t PWR_V[] = {0x0F, 0x00, 0x28, 0x2C, 0x28, 0x38};
 static const uint8_t POF_V[] = {0x00};
 static const uint8_t DRF_V[] = {0x01};
+static const uint8_t BTST_P_V[] = {0xD8, 0x18};
+static const uint8_t BTST_N_V[] = {0xD8, 0x18};
+static const uint8_t r74DataBuf[] = {0xC0, 0x1C, 0x1C, 0xCC, 0xCC, 0xCC, 0x15, 0x15, 0x55};
+#endif
+static const uint8_t PWR_V[] = {0x0F, 0x00, 0x28, 0x2C, 0x28, 0x38};
 static const uint8_t CDI_V[] = {0x37};
 static const uint8_t TRES_V[] = {0x04, 0xB0, 0x03, 0x20};
 static const uint8_t CCSET_V_CUR[] = {0x01};
 static const uint8_t PWS_V[] = {0x22};
-static const uint8_t BTST_P_V[] = {0xD8, 0x18};
-static const uint8_t BTST_N_V[] = {0xD8, 0x18};
 
-static const uint8_t r74DataBuf[] = {0xC0, 0x1C, 0x1C, 0xCC, 0xCC, 0xCC, 0x15, 0x15, 0x55};
 static const uint8_t rf0DataBuf[] = {0x49, 0x55, 0x13, 0x5D, 0x05, 0x10};
 static const uint8_t r60DataBuf[] = {0x03, 0x03};
 static const uint8_t r86DataBuf[] = {0x10};
@@ -48,11 +66,11 @@ static const uint8_t rb1DataBuf[] = {0x02};
 
 // --- Low-level SPI helpers ---
 
-// Send a command with optional data bytes in a single CS window.
-// CS stays LOW for the entire command+data sequence.
-static void cmd_data(uint8_t cmd, const uint8_t *data, size_t len)
+// Send a command with optional data bytes in a single chip-select window on `cs`.
+// The pin stays LOW for the entire command+data sequence.
+static void cmd_data_on(gpio_num_t cs, uint8_t cmd, const uint8_t *data, size_t len)
 {
-    gpio_set_level(g_cfg.pin_cs, 0);  // CS low
+    gpio_set_level(cs, 0);  // CS low
 
     // Send Command
     gpio_set_level(g_cfg.pin_dc, 0);  // DC low = command
@@ -66,7 +84,13 @@ static void cmd_data(uint8_t cmd, const uint8_t *data, size_t len)
         spi_device_transmit(spi, &t_data);
     }
 
-    gpio_set_level(g_cfg.pin_cs, 1);  // CS high
+    gpio_set_level(cs, 1);  // CS high
+}
+
+// Left (master) controller only: CS LOW, CS1 stays HIGH.
+static void cmd_data(uint8_t cmd, const uint8_t *data, size_t len)
+{
+    cmd_data_on(g_cfg.pin_cs, cmd, data, len);
 }
 
 // Send a command targeting both controllers (CS1 LOW during cmd_data)
@@ -77,6 +101,14 @@ static void cmd_data_both(uint8_t cmd, const uint8_t *data, size_t len)
     gpio_set_level(g_cfg.pin_cs1, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
 }
+
+#if CONFIG_EP_ED2208_NCA_PANEL_GDEB0709E01
+// Right (slave) controller only: CS1 LOW, CS stays HIGH.
+static void cmd_data_cs1(uint8_t cmd, const uint8_t *data, size_t len)
+{
+    cmd_data_on(g_cfg.pin_cs1, cmd, data, len);
+}
+#endif
 
 static bool is_busy(void)
 {
@@ -179,13 +211,29 @@ static void send_init_sequence(void)
     // 0xF0 through TRES — both controllers
     cmd_data_both(0xF0, rf0DataBuf, sizeof(rf0DataBuf));
     cmd_data_both(0x00, PSR_V, sizeof(PSR_V));
+#if CONFIG_EP_ED2208_NCA_PANEL_GDEB0709E01
+    // Vendor order for the GDEB0709E01: DCDC (left only) and PLL right after PSR.
+    cmd_data(0xA5, DCDC_V, sizeof(DCDC_V));
+    cmd_data_both(0x30, PLL_V, sizeof(PLL_V));
+#endif
     cmd_data_both(0x50, CDI_V, sizeof(CDI_V));
     cmd_data_both(0x60, r60DataBuf, sizeof(r60DataBuf));
+#if CONFIG_EP_ED2208_NCA_PANEL_GDEB0709E01
+    // POFS is per controller and the two halves take different values.
+    cmd_data(0x03, POFS_M_V, sizeof(POFS_M_V));
+    cmd_data_cs1(0x03, POFS_S_V, sizeof(POFS_S_V));
+#endif
     cmd_data_both(0x86, r86DataBuf, sizeof(r86DataBuf));
     cmd_data_both(0xE3, PWS_V, sizeof(PWS_V));
+#if CONFIG_EP_ED2208_NCA_PANEL_GDEB0709E01
+    cmd_data_both(0xE0, CCSET_V_CUR, sizeof(CCSET_V_CUR));
+#endif
     cmd_data_both(0x61, TRES_V, sizeof(TRES_V));
 
     // PWR through 0xB1 — left controller only (CS1 stays HIGH)
+#if CONFIG_EP_ED2208_NCA_PANEL_GDEB0709E01
+    cmd_data(0xA4, CMDA4_V, sizeof(CMDA4_V));
+#endif
     cmd_data(0x01, PWR_V, sizeof(PWR_V));
     vTaskDelay(pdMS_TO_TICKS(10));
     cmd_data(0xB6, rb6DataBuf, sizeof(rb6DataBuf));
@@ -239,7 +287,11 @@ void epaper_init(const epaper_config_t *cfg)
 {
     g_cfg = *cfg;
 
+#if CONFIG_EP_ED2208_NCA_PANEL_GDEB0709E01
+    ESP_LOGI(TAG, "Initializing GDEB0709E01 (Spectra 6, 7.09\") on the ED2208-NCA driver");
+#else
     ESP_LOGI(TAG, "Initializing ED2208-NCA (Spectra 6, 13.3\") E-Paper Driver");
+#endif
 
     spi_add_device();
     gpio_init();
@@ -350,6 +402,9 @@ void epaper_display(uint8_t *image)
     // PON — both controllers
     cmd_data_both(0x04, NULL, 0);
     wait_busy("power_on");
+#if CONFIG_EP_ED2208_NCA_PANEL_GDEB0709E01
+    vTaskDelay(pdMS_TO_TICKS(50));  // vendor settles 50 ms between PON and DRF
+#endif
 
     // DRF — both controllers
     cmd_data_both(0x12, DRF_V, sizeof(DRF_V));
