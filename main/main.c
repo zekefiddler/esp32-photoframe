@@ -37,6 +37,7 @@
 #include "ota_manager.h"
 #include "periodic_tasks.h"
 #include "power_manager.h"
+#include "die_temp.h"
 #include "processing_settings.h"
 #include "splash_screen.h"
 #include "storage.h"
@@ -116,6 +117,25 @@ static esp_err_t sntp_sync_periodic_callback(void)
 }
 
 // Helper function to connect to WiFi with timeout
+// Consecutive failed boots, kept in NVS so they survive the restart between
+// attempts. See WIFI_FAILS_BEFORE_PROVISION.
+static int wifi_fail_count_bump(bool reset)
+{
+    nvs_handle_t h;
+    int32_t n = 0;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        return reset ? 0 : 1;
+    }
+    nvs_get_i32(h, NVS_WIFI_FAILS_KEY, &n);
+    int32_t next = reset ? 0 : n + 1;
+    if (next != n) {                 // no flash write when nothing changed
+        nvs_set_i32(h, NVS_WIFI_FAILS_KEY, next);
+        nvs_commit(h);
+    }
+    nvs_close(h);
+    return (int) next;
+}
+
 static bool connect_to_wifi_with_timeout(int timeout_seconds)
 {
     char wifi_ssid[WIFI_SSID_MAX_LEN] = {0};
@@ -671,6 +691,7 @@ void app_main(void)
     }
 
     if (connect_to_wifi_with_timeout(30)) {
+        wifi_fail_count_bump(true);
         // Check and run periodic tasks (OTA check, SNTP sync if due)
         // Note: If RTC was invalid at boot, sntp_sync was already forced via
         // periodic_tasks_force_run()
@@ -680,7 +701,20 @@ void app_main(void)
         // Start mDNS service
         ESP_ERROR_CHECK(mdns_service_init());
     } else {
-        ESP_LOGW(TAG, "Failed to connect to WiFi - clearing credentials");
+        int fails = wifi_fail_count_bump(false);
+        if (fails < WIFI_FAILS_BEFORE_PROVISION) {
+            ESP_LOGW(TAG, "Failed to connect to WiFi (%d of %d before provisioning); keeping credentials",
+                     fails, WIFI_FAILS_BEFORE_PROVISION);
+            if (config_manager_get_deep_sleep_enabled()) {
+                ESP_LOGW(TAG, "Sleeping %d s before trying again", WIFI_RETRY_SLEEP_SEC);
+                power_manager_enter_sleep_with_timer(WIFI_RETRY_SLEEP_SEC);   // does not return
+            }
+            ESP_LOGW(TAG, "Waiting %d s before trying again", WIFI_RETRY_AWAKE_SEC);
+            vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_AWAKE_SEC * 1000));
+            esp_restart();
+        }
+        ESP_LOGW(TAG, "Failed to connect to WiFi %d boots in a row - clearing credentials", fails);
+        wifi_fail_count_bump(true);
         nvs_handle_t nvs_handle;
         if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
             nvs_erase_key(nvs_handle, NVS_WIFI_SSID_KEY);
@@ -734,6 +768,7 @@ void app_main(void)
     ha_notify_online(NULL);
 
     ESP_LOGI(TAG, "PhotoFrame started successfully");
+    ESP_LOGI(TAG, "Die temperature: %.1f C", die_temp_read());
 
     // Delay OTA check to avoid competing with boot-time network activity
     vTaskDelay(pdMS_TO_TICKS(10000));

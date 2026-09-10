@@ -102,6 +102,17 @@ typedef enum { IP_MODE_DHCP = 0, IP_MODE_STATIC = 1 } ip_mode_t;
 // WiFi
 #define NVS_WIFI_SSID_KEY "wifi_ssid"
 #define NVS_WIFI_PASS_KEY "wifi_pass"
+// Consecutive boots that failed to associate. Credentials are erased (and the
+// setup AP raised) only after WIFI_FAILS_BEFORE_PROVISION of them in a row: one
+// failed boot is a router rebooting, not a changed password, and a frame that
+// wipes itself on the first miss goes dark until someone re-provisions it.
+#define NVS_WIFI_FAILS_KEY "wifi_fails"
+#define WIFI_FAILS_BEFORE_PROVISION 5
+// Between failed boots: sleep this long (deep-sleep frames) or wait this long
+// awake before retrying, so a dead router is not met with a radio pinned at
+// full power in a boot loop.
+#define WIFI_RETRY_SLEEP_SEC 900
+#define WIFI_RETRY_AWAKE_SEC 60
 
 // General
 #define NVS_NAMESPACE "photoframe"

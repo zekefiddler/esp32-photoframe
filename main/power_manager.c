@@ -1,4 +1,5 @@
 #include "power_manager.h"
+#include "die_temp.h"
 
 #include <driver/gpio.h>
 #include <driver/rtc_io.h>
@@ -329,7 +330,9 @@ esp_err_t power_manager_init(void)
     return ESP_OK;
 }
 
-void power_manager_enter_sleep(void)
+// `timer_sec` > 0 forces a plain timer wake that many seconds out, in place of
+// the cron-derived one; 0 keeps the normal auto-rotate behaviour.
+static void enter_sleep(uint32_t timer_sec)
 {
     power_manager_disable_auto_light_sleep();
 
@@ -350,12 +353,12 @@ void power_manager_enter_sleep(void)
     board_hal_led_set(BOARD_HAL_LED_ACTIVITY, false);
 
     // Check if auto-rotate is enabled
-    if (config_manager_get_auto_rotate()) {
+    if (timer_sec > 0 || config_manager_get_auto_rotate()) {
         // Use timer-based sleep for auto-rotate
-        int wake_seconds = get_seconds_until_next_wakeup();
+        int wake_seconds = timer_sec > 0 ? (int) timer_sec : get_seconds_until_next_wakeup();
 
-        ESP_LOGI(TAG, "Auto-rotate enabled, setting timer wake-up for %d seconds (%s)",
-                 wake_seconds, "cron");
+        ESP_LOGI(TAG, "Setting timer wake-up for %d seconds (%s)", wake_seconds,
+                 timer_sec > 0 ? "fixed" : "cron");
         esp_sleep_enable_timer_wakeup(wake_seconds * 1000000ULL);
 
         // Store expected wakeup time in RTC memory for drift detection
@@ -400,6 +403,7 @@ void power_manager_enter_sleep(void)
     storage_unmount();
 #endif
 
+    ESP_LOGI(TAG, "Die temperature before sleep: %.1f C", die_temp_read());
     ESP_LOGI(TAG, "Entering deep sleep now");
     vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -413,6 +417,16 @@ void power_manager_enter_sleep(void)
 #endif
 
     esp_deep_sleep_start();
+}
+
+void power_manager_enter_sleep(void)
+{
+    enter_sleep(0);
+}
+
+void power_manager_enter_sleep_with_timer(uint32_t sleep_time_sec)
+{
+    enter_sleep(sleep_time_sec);
 }
 
 void power_manager_reset_sleep_timer(void)

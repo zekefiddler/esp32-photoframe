@@ -24,6 +24,7 @@ Get device system information.
   "project_name": "esp32-photoframe",
   "compile_time": "12:34:56",
   "compile_date": "Apr 17 2026",
+  "die_temp_c": 41.2,
   "idf_version": "v5.3",
   "width": 800,
   "height": 480,
