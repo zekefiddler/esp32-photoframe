@@ -110,19 +110,18 @@ static void cmd_data_cs1(uint8_t cmd, const uint8_t *data, size_t len)
 }
 #endif
 
-// Whether the panel's rail is up and its controller initialised. The panel is
-// powered ONLY while it is being drawn (see epaper_display): the vendor's own
-// precautions say a panel left powered without refreshing is damaged, and a
-// reset between power-on and power-off leaves its charge pumps running into a
-// controller nothing can talk to. Dark when idle is the safe state.
+// Whether the controller is up and initialised. It is only ever up inside
+// epaper_display: every draw resets and re-initialises it, and ends by putting
+// it in its own deep-sleep state (panel_sleep). The rail is cut for the
+// board's deep sleep and when the controller stops answering (panel_rail_off).
 static bool g_powered = false;
 
 // BUSY limits. The short one is for phases a healthy controller finishes in
 // well under a second, so a stuck line there means a dead or hung controller.
-// The refresh is different: 27 s typical at 25 C on the GDEB0709E01 datasheet,
-// ~38 s measured on the bench, and slower as the glass cools. The old single
-// 40 s limit was within seconds of cutting a healthy refresh short with the
-// power-off command on a room-temperature panel, and would have on a cold one.
+// The refresh is different: a full refresh of the GDEB0709E01 takes ~45 s on
+// the bench at room temperature, and longer as the glass cools. The old single
+// 40 s limit was within seconds of sending the power-off command to a healthy
+// refresh still in progress.
 #define BUSY_SHORT_MS 40000
 #define BUSY_REFRESH_MS 120000
 
@@ -132,8 +131,8 @@ static bool is_busy(void)
 }
 
 // Wait for BUSY to release, up to `max_ms`. Returns false on timeout; the
-// caller decides what a silent controller means. During a refresh it means
-// the rail gets cut (see epaper_display) - never "carry on and hope".
+// caller decides what a silent controller means. In epaper_display it means
+// the rail gets cut - never "carry on and hope".
 static bool wait_busy(const char *label, uint32_t max_ms)
 {
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -151,13 +150,13 @@ static bool wait_busy(const char *label, uint32_t max_ms)
 
 // --- Hardware setup ---
 
-// Claim the panel's pins and make sure its rail is OFF. Called once at boot:
-// the panel comes on only for a draw (panel_power_up). The 250 ms dark period
-// matters on its own - a controller left mid-waveform by a reset, a crash or a
-// brownout keeps its charge pumps running and answers nothing; no command
-// clears that, only a rail that actually drops. On a board whose enable pin
-// the boot ROM drives high through reset (the XIAO EE02/EE04: GPIO43 is UART
-// TX) this is the only power cycle the panel ever gets.
+// Claim the panel's pins and hold its rail OFF for 250 ms. Called once at
+// boot; the rail comes up for the first draw (panel_power_up). The dark period
+// is the point: a controller left mid-waveform by a reset, a crash or a
+// brownout keeps its charge pumps running and answers nothing, and no command
+// clears that - only a rail that actually drops. On the XIAO EE02 the enable
+// pin is GPIO43 (U0TXD), which the boot ROM drives high through reset, so a
+// reset alone never gives that panel a power cycle; this does.
 static void gpio_init(void)
 {
     // Release any pad holds latched by a previous deep-sleep cycle
@@ -228,47 +227,57 @@ static void panel_power_up(void)
     g_powered = true;
 }
 
-// Take the panel dark. `sleep_first` sends the controller's own sleep command,
-// which a healthy controller acknowledges and a hung one ignores - the rail
-// cut is what actually matters, so it happens either way. `latch` holds every
-// panel-facing pad through deep sleep. Without a rail to cut (pin_enable < 0)
-// the sleep command is all there is.
-static void panel_power_down(bool sleep_first, bool latch)
+// Put the controller into its own deep-sleep state between draws. The rail
+// stays up: SPI2 is shared with the SD card on some boards, and clocking a bus
+// into an unpowered controller back-feeds it through its ESD diodes. The next
+// draw resets and re-initialises it (panel_power_up).
+static void panel_sleep(void)
 {
-    if (sleep_first && g_powered) {
-        cmd_data(0x07, (uint8_t[]){0xA5}, 1);  // DEEP_SLEEP
-        vTaskDelay(pdMS_TO_TICKS(1));
-        wait_busy("deepsleep", BUSY_SHORT_MS);
+    if (!g_powered) {
+        return;
     }
-    if (g_cfg.pin_enable >= 0) {
-        // Drive panel-facing GPIOs LOW before cutting VDD so they don't
-        // back-feed through the panel's ESD diodes once its rail drops to
-        // 0V. SPI peripheral pads (MOSI/SCLK) become Hi-Z in deep sleep
-        // and don't need handling.
-        gpio_set_level(g_cfg.pin_cs, 0);
-        gpio_set_level(g_cfg.pin_dc, 0);
-        gpio_set_level(g_cfg.pin_rst, 0);
-        if (g_cfg.pin_cs1 >= 0) {
-            gpio_set_level(g_cfg.pin_cs1, 0);
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));       // Ensure display enters sleep before cutting power
-        gpio_set_level(g_cfg.pin_enable, 0);  // Cut power
-        if (latch) {
-            // Latch the pads low so the rail stays cut and panel-facing
-            // signals stay grounded once the digital IO domain powers down
-            // during deep sleep, and arm deep-sleep hold so the latch
-            // survives into deep sleep. All calls are idempotent.
-            gpio_hold_en(g_cfg.pin_enable);
-            gpio_hold_en(g_cfg.pin_cs);
-            gpio_hold_en(g_cfg.pin_dc);
-            gpio_hold_en(g_cfg.pin_rst);
-            if (g_cfg.pin_cs1 >= 0) {
-                gpio_hold_en(g_cfg.pin_cs1);
-            }
-            gpio_deep_sleep_hold_en();
-        }
-    }
+    cmd_data(0x07, (uint8_t[]){0xA5}, 1);  // DEEP_SLEEP
+    vTaskDelay(pdMS_TO_TICKS(1));
+    wait_busy("deepsleep", BUSY_SHORT_MS);
     g_powered = false;
+}
+
+// Cut the panel's rail. Used for deep sleep (`latch` holds every panel-facing
+// pad low through it) and for a controller that stopped answering, where this
+// is the only thing guaranteed to stop its charge pumps. Boards without a rail
+// to cut (pin_enable < 0) only get panel_sleep.
+static void panel_rail_off(bool latch)
+{
+    g_powered = false;
+    if (g_cfg.pin_enable < 0) {
+        return;
+    }
+    // Drive panel-facing GPIOs LOW before cutting VDD so they don't
+    // back-feed through the panel's ESD diodes once its rail drops to
+    // 0V. SPI peripheral pads (MOSI/SCLK) become Hi-Z in deep sleep
+    // and don't need handling.
+    gpio_set_level(g_cfg.pin_cs, 0);
+    gpio_set_level(g_cfg.pin_dc, 0);
+    gpio_set_level(g_cfg.pin_rst, 0);
+    if (g_cfg.pin_cs1 >= 0) {
+        gpio_set_level(g_cfg.pin_cs1, 0);
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));       // Ensure display enters sleep before cutting power
+    gpio_set_level(g_cfg.pin_enable, 0);  // Cut power
+    if (latch) {
+        // Latch the pads low so the rail stays cut and panel-facing
+        // signals stay grounded once the digital IO domain powers down
+        // during deep sleep, and arm deep-sleep hold so the latch
+        // survives into deep sleep. All calls are idempotent.
+        gpio_hold_en(g_cfg.pin_enable);
+        gpio_hold_en(g_cfg.pin_cs);
+        gpio_hold_en(g_cfg.pin_dc);
+        gpio_hold_en(g_cfg.pin_rst);
+        if (g_cfg.pin_cs1 >= 0) {
+            gpio_hold_en(g_cfg.pin_cs1);
+        }
+        gpio_deep_sleep_hold_en();
+    }
 }
 
 static void spi_add_device(void)
@@ -437,6 +446,7 @@ void epaper_display(uint8_t *image)
     uint8_t *line_buf = heap_caps_malloc(block_w_bytes, MALLOC_CAP_DMA);
     if (!line_buf) {
         ESP_LOGE(TAG, "Malloc failed");
+        panel_sleep();
         goto out;
     }
 
@@ -518,16 +528,16 @@ void epaper_display(uint8_t *image)
     }
 
     ESP_LOGI(TAG, "Display update complete");
-    // Idle is dark: sleep the controller and drop the rail until the next draw.
-    panel_power_down(true, false);
+    panel_sleep();
     goto out;
 
 fault:
-    // The controller stopped answering mid-refresh. Its charge pumps may be
-    // running with nobody driving a waveform; the one thing guaranteed to end
-    // that is the rail. No sleep command first - it would not be heard.
-    ESP_LOGE(TAG, "Controller not answering mid-refresh; cutting the panel rail");
-    panel_power_down(false, false);
+    // The controller stopped answering (wait_busy logged which phase). Its
+    // charge pumps may be running with nobody driving a waveform; the one
+    // thing guaranteed to end that is the rail. No sleep command first - it
+    // would not be heard.
+    ESP_LOGE(TAG, "Controller not answering; cutting the panel rail");
+    panel_rail_off(false);
 
 out:
 #ifdef CONFIG_PM_ENABLE
@@ -548,10 +558,8 @@ void epaper_enter_deepsleep(void)
     }
 #endif
 
-    // Usually already dark (every draw ends that way); this latches the pads
-    // through deep sleep, and sleeps the controller first if a draw was cut
-    // short and left it up.
-    panel_power_down(true, true);
+    panel_sleep();        // no-op unless a draw was cut short and left it up
+    panel_rail_off(true);
 
 #ifdef CONFIG_PM_ENABLE
     if (pm_lock) {

@@ -116,26 +116,58 @@ static esp_err_t sntp_sync_periodic_callback(void)
     return ESP_OK;
 }
 
-// Helper function to connect to WiFi with timeout
-// Consecutive failed boots, kept in NVS so they survive the restart between
-// attempts. See WIFI_FAILS_BEFORE_PROVISION.
+// Consecutive boots that failed to associate, kept in NVS so they survive the
+// restart or sleep between attempts. See WIFI_FAILS_BEFORE_PROVISION.
 static int wifi_fail_count_bump(bool reset)
 {
     nvs_handle_t h;
     int32_t n = 0;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "wifi_fails: nvs_open failed: %s", esp_err_to_name(err));
         return reset ? 0 : 1;
     }
-    nvs_get_i32(h, NVS_WIFI_FAILS_KEY, &n);
+    nvs_get_i32(h, NVS_WIFI_FAILS_KEY, &n);  // missing key leaves n at 0
     int32_t next = reset ? 0 : n + 1;
-    if (next != n) {                 // no flash write when nothing changed
-        nvs_set_i32(h, NVS_WIFI_FAILS_KEY, next);
-        nvs_commit(h);
+    if (next != n) {  // no flash write when nothing changed
+        err = nvs_set_i32(h, NVS_WIFI_FAILS_KEY, next);
+        if (err == ESP_OK) {
+            err = nvs_commit(h);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "wifi_fails: write failed: %s", esp_err_to_name(err));
+        }
     }
     nvs_close(h);
     return (int) next;
 }
 
+// One more boot that could not associate. Below the threshold this only
+// counts it; at the threshold it erases the credentials and restarts into
+// provisioning (and does not return).
+static void wifi_boot_failed(void)
+{
+    int fails = wifi_fail_count_bump(false);
+    if (fails < WIFI_FAILS_BEFORE_PROVISION) {
+        ESP_LOGW(TAG, "Failed to connect to WiFi (%d of %d before provisioning); keeping credentials",
+                 fails, WIFI_FAILS_BEFORE_PROVISION);
+        return;
+    }
+    ESP_LOGW(TAG, "Failed to connect to WiFi %d boots in a row - clearing credentials", fails);
+    wifi_fail_count_bump(true);
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        nvs_erase_key(nvs_handle, NVS_WIFI_SSID_KEY);
+        nvs_erase_key(nvs_handle, NVS_WIFI_PASS_KEY);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
+    ESP_LOGI(TAG, "Restarting to enter provisioning mode...");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_restart();
+}
+
+// Helper function to connect to WiFi with timeout
 static bool connect_to_wifi_with_timeout(int timeout_seconds)
 {
     char wifi_ssid[WIFI_SSID_MAX_LEN] = {0};
@@ -313,9 +345,11 @@ void deep_sleep_wake_main(wakeup_source_t wakeup_src)
 
         if (connect_to_wifi_with_timeout(60)) {
             wifi_connected = true;
+            wifi_fail_count_bump(true);
             ESP_LOGI(TAG, "WiFi connected");
         } else {
             ESP_LOGW(TAG, "WiFi connection timeout");
+            wifi_boot_failed();  // the next cron wake is the retry
         }
     }
 
@@ -701,29 +735,13 @@ void app_main(void)
         // Start mDNS service
         ESP_ERROR_CHECK(mdns_service_init());
     } else {
-        int fails = wifi_fail_count_bump(false);
-        if (fails < WIFI_FAILS_BEFORE_PROVISION) {
-            ESP_LOGW(TAG, "Failed to connect to WiFi (%d of %d before provisioning); keeping credentials",
-                     fails, WIFI_FAILS_BEFORE_PROVISION);
-            if (config_manager_get_deep_sleep_enabled()) {
-                ESP_LOGW(TAG, "Sleeping %d s before trying again", WIFI_RETRY_SLEEP_SEC);
-                power_manager_enter_sleep_with_timer(WIFI_RETRY_SLEEP_SEC);   // does not return
-            }
-            ESP_LOGW(TAG, "Waiting %d s before trying again", WIFI_RETRY_AWAKE_SEC);
-            vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_AWAKE_SEC * 1000));
-            esp_restart();
+        wifi_boot_failed();  // returns only below the threshold
+        if (config_manager_get_deep_sleep_enabled()) {
+            ESP_LOGW(TAG, "Sleeping %d s before trying again", WIFI_RETRY_SLEEP_SEC);
+            power_manager_enter_sleep_with_timer(WIFI_RETRY_SLEEP_SEC);  // does not return
         }
-        ESP_LOGW(TAG, "Failed to connect to WiFi %d boots in a row - clearing credentials", fails);
-        wifi_fail_count_bump(true);
-        nvs_handle_t nvs_handle;
-        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
-            nvs_erase_key(nvs_handle, NVS_WIFI_SSID_KEY);
-            nvs_erase_key(nvs_handle, NVS_WIFI_PASS_KEY);
-            nvs_commit(nvs_handle);
-            nvs_close(nvs_handle);
-        }
-        ESP_LOGI(TAG, "Restarting to enter provisioning mode...");
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        ESP_LOGW(TAG, "Waiting %d s before trying again", WIFI_RETRY_AWAKE_SEC);
+        vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_AWAKE_SEC * 1000));
         esp_restart();
     }
 

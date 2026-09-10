@@ -392,6 +392,8 @@ static void enter_sleep(uint32_t timer_sec)
     ESP_LOGI(TAG, "Configuring Board HAL for deep sleep");
     board_hal_prepare_for_sleep();
 
+    ESP_LOGI(TAG, "Die temperature before sleep: %.1f C", die_temp_read());
+
     // Flush buffered debug log lines and close the file before storage goes
     // away. Capture resumes automatically on the next boot.
     debug_log_flush();
@@ -403,7 +405,6 @@ static void enter_sleep(uint32_t timer_sec)
     storage_unmount();
 #endif
 
-    ESP_LOGI(TAG, "Die temperature before sleep: %.1f C", die_temp_read());
     ESP_LOGI(TAG, "Entering deep sleep now");
     vTaskDelay(pdMS_TO_TICKS(100));
 
