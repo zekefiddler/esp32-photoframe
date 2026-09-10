@@ -255,11 +255,11 @@ esp_err_t power_manager_init(void)
         ext1_wakeup_pin_mask = esp_sleep_get_ext1_wakeup_status();
 
         if (BOARD_HAL_WAKEUP_KEY != GPIO_NUM_NC &&
-            (ext1_wakeup_pin_mask & (1ULL << BOARD_HAL_WAKEUP_KEY))) {
+            (ext1_wakeup_pin_mask & (1ULL << (BOARD_HAL_WAKEUP_KEY < 0 ? 0 : BOARD_HAL_WAKEUP_KEY)))) {
             wakeup_source = WAKEUP_SOURCE_BOOT_BUTTON;
             ESP_LOGI(TAG, "Wakeup caused by BOOT button (GPIO %d)", BOARD_HAL_WAKEUP_KEY);
         } else if (BOARD_HAL_ROTATE_KEY != GPIO_NUM_NC &&
-                   (ext1_wakeup_pin_mask & (1ULL << BOARD_HAL_ROTATE_KEY))) {
+                   (ext1_wakeup_pin_mask & (1ULL << (BOARD_HAL_ROTATE_KEY < 0 ? 0 : BOARD_HAL_ROTATE_KEY)))) {
             wakeup_source = WAKEUP_SOURCE_ROTATE_BUTTON;
             ESP_LOGI(TAG, "Wakeup caused by ROTATE button (GPIO %d)", BOARD_HAL_ROTATE_KEY);
         } else if (BOARD_HAL_CLEAR_KEY != GPIO_NUM_NC &&
@@ -278,10 +278,10 @@ esp_err_t power_manager_init(void)
     // Configure button GPIOs as input with pull-ups
     uint64_t pin_mask = 0;
     if (BOARD_HAL_WAKEUP_KEY != GPIO_NUM_NC) {
-        pin_mask |= (1ULL << BOARD_HAL_WAKEUP_KEY);
+        pin_mask |= (1ULL << (BOARD_HAL_WAKEUP_KEY < 0 ? 0 : BOARD_HAL_WAKEUP_KEY));
     }
     if (BOARD_HAL_ROTATE_KEY != GPIO_NUM_NC) {
-        pin_mask |= (1ULL << BOARD_HAL_ROTATE_KEY);
+        pin_mask |= (1ULL << (BOARD_HAL_ROTATE_KEY < 0 ? 0 : BOARD_HAL_ROTATE_KEY));
     }
     if (BOARD_HAL_CLEAR_KEY != GPIO_NUM_NC) {
         pin_mask |= (1ULL << (BOARD_HAL_CLEAR_KEY < 0 ? 0 : BOARD_HAL_CLEAR_KEY));
@@ -367,10 +367,10 @@ void power_manager_enter_sleep(void)
     // Enable boot button and key button wake-up (ESP32-S3 only supports EXT1)
     uint64_t wakeup_mask = 0;
     if (BOARD_HAL_WAKEUP_KEY != GPIO_NUM_NC) {
-        wakeup_mask |= (1ULL << BOARD_HAL_WAKEUP_KEY);
+        wakeup_mask |= (1ULL << (BOARD_HAL_WAKEUP_KEY < 0 ? 0 : BOARD_HAL_WAKEUP_KEY));
     }
     if (BOARD_HAL_ROTATE_KEY != GPIO_NUM_NC) {
-        wakeup_mask |= (1ULL << BOARD_HAL_ROTATE_KEY);
+        wakeup_mask |= (1ULL << (BOARD_HAL_ROTATE_KEY < 0 ? 0 : BOARD_HAL_ROTATE_KEY));
     }
     if (BOARD_HAL_CLEAR_KEY != GPIO_NUM_NC) {
         wakeup_mask |= (1ULL << (BOARD_HAL_CLEAR_KEY < 0 ? 0 : BOARD_HAL_CLEAR_KEY));
