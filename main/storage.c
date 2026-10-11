@@ -215,6 +215,24 @@ esp_err_t storage_format(void)
     return ESP_OK;
 }
 
+void storage_reject_wifi_credentials(void)
+{
+#ifdef CONFIG_HAS_SDCARD
+    if (!sdcard_is_mounted()) {
+        return;
+    }
+    const char *paths[] = {FS_MOUNT_POINT "/config/wifi.txt", FS_MOUNT_POINT "/wifi.txt", NULL};
+    for (int i = 0; paths[i] != NULL; i++) {
+        char rejected[96];
+        snprintf(rejected, sizeof(rejected), "%s.rejected", paths[i]);
+        remove(rejected);  // a previous rejection must not block this one
+        if (rename(paths[i], rejected) == 0) {
+            ESP_LOGW(TAG, "Renamed %s to %s so it is not imported again", paths[i], rejected);
+        }
+    }
+#endif
+}
+
 esp_err_t storage_read_wifi_credentials(char *ssid, char *password)
 {
 #ifdef CONFIG_HAS_SDCARD
