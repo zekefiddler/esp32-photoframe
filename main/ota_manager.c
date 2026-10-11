@@ -162,6 +162,12 @@ static esp_err_t fetch_github_release_info(char *latest_version, size_t version_
     int content_length = esp_http_client_fetch_headers(client);
     int status_code = esp_http_client_get_status_code(client);
 
+    if (status_code == 404) {
+        // The repository has published no release (this fork never does).
+        // That is "nothing newer", not a failed check.
+        err = ESP_ERR_NOT_FOUND;
+        goto cleanup;
+    }
     if (status_code != 200) {
         ESP_LOGE(TAG, "HTTP GET failed, status = %d", status_code);
         err = ESP_FAIL;
@@ -287,6 +293,12 @@ static void ota_check_task(void *pvParameter)
     esp_err_t err = fetch_github_release_info(latest_version, sizeof(latest_version), download_url,
                                               sizeof(download_url));
 
+    if (err == ESP_ERR_NOT_FOUND) {
+        ESP_LOGI(TAG, "No release published; nothing to update");
+        snprintf(latest_version, sizeof(latest_version), "%s", ota_status.current_version);
+        download_url[0] = '\0';
+        err = ESP_OK;  // compares equal below: idle, check time recorded
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to fetch release info");
         set_ota_state(OTA_STATE_ERROR, "Failed to check for updates");
