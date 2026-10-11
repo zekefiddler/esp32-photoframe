@@ -38,6 +38,9 @@ static esp_netif_t *s_sta_netif = NULL;
 #define RECONNECT_MIN_MS 5000
 #define RECONNECT_MAX_MS 60000
 static bool s_auto_reconnect = false;
+// Set only by wifi_manager_disconnect(): the event handler then skips the quick
+// retries too. Provisioning drives esp_wifi_* directly and never sets it.
+static bool s_disconnect_requested = false;
 static uint32_t s_reconnect_ms = RECONNECT_MIN_MS;
 static esp_timer_handle_t s_reconnect_timer = NULL;
 
@@ -73,6 +76,11 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         // before falling back to the A record.
         esp_netif_create_ip6_linklocal(s_sta_netif);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_disconnect_requested) {
+            s_is_connected = false;
+            ESP_LOGI(TAG, "disconnected on request; not reconnecting");
+            return;
+        }
         if (s_retry_num < 5) {
             esp_wifi_connect();
             s_retry_num++;
@@ -261,6 +269,7 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
     s_retry_num = 0;
     s_reconnect_ms = RECONNECT_MIN_MS;
     s_auto_reconnect = true;
+    s_disconnect_requested = false;
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                            pdFALSE, pdFALSE, portMAX_DELAY);
@@ -280,6 +289,7 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
 esp_err_t wifi_manager_disconnect(void)
 {
     s_auto_reconnect = false;
+    s_disconnect_requested = true;
     if (s_reconnect_timer) {
         esp_timer_stop(s_reconnect_timer);
     }
