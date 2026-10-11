@@ -12,6 +12,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/err.h"
 #include "lwip/sys.h"
@@ -43,13 +44,20 @@ static bool s_auto_reconnect = false;
 static bool s_disconnect_requested = false;
 static uint32_t s_reconnect_ms = RECONNECT_MIN_MS;
 static esp_timer_handle_t s_reconnect_timer = NULL;
+// Serialises the timer's check-then-connect with wifi_manager_disconnect():
+// esp_timer_stop() does not wait for a callback already running, so without it
+// a callback could pass the check, then reconnect after the disconnect.
+static StaticSemaphore_t s_reconnect_lock_buf;
+static SemaphoreHandle_t s_reconnect_lock = NULL;
 
 static void reconnect_cb(void *arg)
 {
+    xSemaphoreTake(s_reconnect_lock, portMAX_DELAY);
     if (s_auto_reconnect) {
         ESP_LOGI(TAG, "background reconnect attempt");
         esp_wifi_connect();  // errors (WiFi stopped for sleep, AP-only setup) end the chain
     }
+    xSemaphoreGive(s_reconnect_lock);
 }
 
 static void schedule_reconnect(void)
@@ -176,6 +184,7 @@ esp_err_t wifi_manager_init(void)
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_GOT_IP6, &event_handler,
                                                         NULL, &instance_got_ip6));
 
+    s_reconnect_lock = xSemaphoreCreateMutexStatic(&s_reconnect_lock_buf);
     const esp_timer_create_args_t reconnect_args = {.callback = reconnect_cb, .name = "wifi_reconn"};
     ESP_ERROR_CHECK(esp_timer_create(&reconnect_args, &s_reconnect_timer));
 
@@ -288,13 +297,20 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
 
 esp_err_t wifi_manager_disconnect(void)
 {
+    if (s_reconnect_lock) {
+        xSemaphoreTake(s_reconnect_lock, portMAX_DELAY);
+    }
     s_auto_reconnect = false;
     s_disconnect_requested = true;
     if (s_reconnect_timer) {
         esp_timer_stop(s_reconnect_timer);
     }
     s_is_connected = false;
-    return esp_wifi_disconnect();
+    esp_err_t err = esp_wifi_disconnect();
+    if (s_reconnect_lock) {
+        xSemaphoreGive(s_reconnect_lock);
+    }
+    return err;
 }
 
 bool wifi_manager_is_connected(void)
