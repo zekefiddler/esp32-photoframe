@@ -204,14 +204,17 @@ static void gpio_init(void)
 }
 
 static void hw_reset(void);
-static void send_init_sequence(void);
+static bool send_init_sequence(void);
+static void panel_rail_off(bool latch);
 
 // Rail up, reset, init sequence: everything a draw needs. Idempotent by way
-// of g_powered, so a caller can ask for it before every draw.
-static void panel_power_up(void)
+// of g_powered, so a caller can ask for it before every draw. Returns false if
+// the controller never released BUSY after reset; the rail is already cut then,
+// so the caller must not send it anything.
+static bool panel_power_up(void)
 {
     if (g_powered) {
-        return;
+        return true;
     }
     if (g_cfg.pin_enable >= 0) {
         gpio_set_level(g_cfg.pin_enable, 1);
@@ -223,8 +226,13 @@ static void panel_power_up(void)
     gpio_set_level(g_cfg.pin_dc, 0);
     gpio_set_level(g_cfg.pin_rst, 1);
     hw_reset();
-    send_init_sequence();
+    if (!send_init_sequence()) {
+        ESP_LOGE(TAG, "Controller stuck after reset; cutting the panel rail");
+        panel_rail_off(false);
+        return false;
+    }
     g_powered = true;
+    return true;
 }
 
 // Put the controller into its own deep-sleep state between draws. The rail
@@ -238,7 +246,13 @@ static void panel_sleep(void)
     }
     cmd_data(0x07, (uint8_t[]){0xA5}, 1);  // DEEP_SLEEP
     vTaskDelay(pdMS_TO_TICKS(1));
-    wait_busy("deepsleep", BUSY_SHORT_MS);
+    if (!wait_busy("deepsleep", BUSY_SHORT_MS)) {
+        // It did not take the sleep command, so its charge pumps may still be
+        // running with the rail held up. Cut it, as for any silent controller.
+        ESP_LOGE(TAG, "Controller did not sleep; cutting the panel rail");
+        panel_rail_off(false);
+        return;
+    }
     g_powered = false;
 }
 
@@ -306,9 +320,11 @@ static void hw_reset(void)
 // CS1 selects the right half. LOW = selected.
 // Commands 0xF0 through TRES go to both controllers (CS1 LOW).
 // Commands 0x74 and PWR through 0xB1 go to left controller only (CS1 HIGH).
-static void send_init_sequence(void)
+static bool send_init_sequence(void)
 {
-    wait_busy("init", BUSY_SHORT_MS);
+    if (!wait_busy("init", BUSY_SHORT_MS)) {
+        return false;  // a controller that never came out of reset hears nothing
+    }
 
     // 0x74 — CS1 stays HIGH (left controller only)
     cmd_data(0x74, r74DataBuf, sizeof(r74DataBuf));
@@ -353,6 +369,7 @@ static void send_init_sequence(void)
     vTaskDelay(pdMS_TO_TICKS(10));
     cmd_data(0xB1, rb1DataBuf, sizeof(rb1DataBuf));
     vTaskDelay(pdMS_TO_TICKS(10));
+    return true;
 }
 
 // Convert 4-bit color index to hardware color value
@@ -430,7 +447,9 @@ void epaper_display(uint8_t *image)
 
     ESP_LOGI(TAG, "Starting display update: %d bytes", EPD_BUF_SIZE);
 
-    panel_power_up();
+    if (!panel_power_up()) {
+        goto out;  // rail already cut; nothing to talk to
+    }
 
     // CCSET — both controllers
     cmd_data_both(0xE0, CCSET_V_CUR, sizeof(CCSET_V_CUR));
