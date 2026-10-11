@@ -175,6 +175,9 @@ static void wifi_boot_failed(void)
                  esp_err_to_name(err));
         return;
     }
+    // On SD-card boards the next boot would re-import the same credentials
+    // from wifi.txt and never reach the setup AP; retire the file too.
+    storage_reject_wifi_credentials();
     wifi_fail_count_bump(true);
     ESP_LOGI(TAG, "Restarting to enter provisioning mode...");
     vTaskDelay(pdMS_TO_TICKS(2000));
