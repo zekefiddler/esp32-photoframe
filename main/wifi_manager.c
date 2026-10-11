@@ -5,6 +5,7 @@
 #include "config.h"
 #include "config_manager.h"
 #include "esp_event.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_system.h"
@@ -29,6 +30,35 @@ static int s_retry_num = 0;
 static bool s_is_connected = false;
 static esp_netif_t *s_sta_netif = NULL;
 
+// Once the quick retries are spent (and WIFI_FAIL_BIT has told any waiting boot
+// path), keep trying in the background. A frame that stays awake on USB power
+// never reboots into a fresh connect, so giving up after five quick tries left
+// it off the network for good when its access point blinked for a minute.
+// Cleared by wifi_manager_disconnect() so a deliberate disconnect stays down.
+#define RECONNECT_MIN_MS 5000
+#define RECONNECT_MAX_MS 60000
+static bool s_auto_reconnect = false;
+static uint32_t s_reconnect_ms = RECONNECT_MIN_MS;
+static esp_timer_handle_t s_reconnect_timer = NULL;
+
+static void reconnect_cb(void *arg)
+{
+    if (s_auto_reconnect) {
+        ESP_LOGI(TAG, "background reconnect attempt");
+        esp_wifi_connect();  // errors (WiFi stopped for sleep, AP-only setup) end the chain
+    }
+}
+
+static void schedule_reconnect(void)
+{
+    if (!s_auto_reconnect || !s_reconnect_timer || esp_timer_is_active(s_reconnect_timer)) {
+        return;
+    }
+    esp_timer_start_once(s_reconnect_timer, (uint64_t) s_reconnect_ms * 1000);
+    ESP_LOGI(TAG, "next reconnect in %lu s", (unsigned long) (s_reconnect_ms / 1000));
+    s_reconnect_ms = s_reconnect_ms * 2 > RECONNECT_MAX_MS ? RECONNECT_MAX_MS : s_reconnect_ms * 2;
+}
+
 static void apply_dns_override(void);
 
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id,
@@ -49,6 +79,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
             ESP_LOGI(TAG, "retry to connect to the AP");
         } else {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            schedule_reconnect();
         }
         s_is_connected = false;
         ESP_LOGI(TAG, "connect to the AP fail");
@@ -59,6 +90,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         // servers too (#43).
         apply_dns_override();
         s_retry_num = 0;
+        s_reconnect_ms = RECONNECT_MIN_MS;
         s_is_connected = true;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_GOT_IP6) {
@@ -135,6 +167,9 @@ esp_err_t wifi_manager_init(void)
                                                         &event_handler, NULL, &instance_got_ip));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_GOT_IP6, &event_handler,
                                                         NULL, &instance_got_ip6));
+
+    const esp_timer_create_args_t reconnect_args = {.callback = reconnect_cb, .name = "wifi_reconn"};
+    ESP_ERROR_CHECK(esp_timer_create(&reconnect_args, &s_reconnect_timer));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     // Don't start WiFi here - let wifi_manager_connect() or wifi_provisioning_start_ap() start it
@@ -224,6 +259,8 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));  // Enable power save at boot/connect
 
     s_retry_num = 0;
+    s_reconnect_ms = RECONNECT_MIN_MS;
+    s_auto_reconnect = true;
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                            pdFALSE, pdFALSE, portMAX_DELAY);
@@ -242,6 +279,10 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
 
 esp_err_t wifi_manager_disconnect(void)
 {
+    s_auto_reconnect = false;
+    if (s_reconnect_timer) {
+        esp_timer_stop(s_reconnect_timer);
+    }
     s_is_connected = false;
     return esp_wifi_disconnect();
 }
