@@ -84,21 +84,23 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         // before falling back to the A record.
         esp_netif_create_ip6_linklocal(s_sta_netif);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        // Same lock as wifi_manager_disconnect(): it posts this event and returns,
+        // so there is no deadlock, and a disconnect completing between the check
+        // and the connect below can no longer be undone by a retry.
+        xSemaphoreTake(s_reconnect_lock, portMAX_DELAY);
+        s_is_connected = false;
         if (s_disconnect_requested) {
-            s_is_connected = false;
             ESP_LOGI(TAG, "disconnected on request; not reconnecting");
-            return;
-        }
-        if (s_retry_num < 5) {
+        } else if (s_retry_num < 5) {
             esp_wifi_connect();
             s_retry_num++;
             ESP_LOGI(TAG, "retry to connect to the AP");
         } else {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
             schedule_reconnect();
+            ESP_LOGI(TAG, "connect to the AP fail");
         }
-        s_is_connected = false;
-        ESP_LOGI(TAG, "connect to the AP fail");
+        xSemaphoreGive(s_reconnect_lock);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
