@@ -52,8 +52,9 @@ esp_err_t storage_read_wifi_credentials(char *ssid, char *password);
 /**
  * @brief Rename any wifi.txt to wifi.txt.rejected so its credentials are not
  * imported again. Called when they have failed often enough to give up on them.
+ * Returns false if a file is still in place (read-only or full card).
  */
-void storage_reject_wifi_credentials(void);
+bool storage_reject_wifi_credentials(void);
 
 /**
  * @brief Unmount storage before deep sleep to release flash references
