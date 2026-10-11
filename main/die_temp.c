@@ -1,6 +1,7 @@
 #include "die_temp.h"
 
 #include <math.h>
+#include <stdbool.h>
 
 #include "driver/temperature_sensor.h"
 #include "esp_log.h"
