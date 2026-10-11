@@ -4,12 +4,25 @@
 
 #include "driver/temperature_sensor.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "die_temp";
 static temperature_sensor_handle_t s_tsens = NULL;
 static bool s_failed = false;
 
-float die_temp_read(void)
+// app_main and the HTTP task can both make the first call. Two installs race,
+// and the chip has one sensor, so the loser's install fails and would mark it
+// unavailable for good. The mutex exists before app_main runs.
+static StaticSemaphore_t s_lock_buf;
+static SemaphoreHandle_t s_lock;
+
+__attribute__((constructor)) static void die_temp_lock_init(void)
+{
+    s_lock = xSemaphoreCreateMutexStatic(&s_lock_buf);
+}
+
+static float read_locked(void)
 {
     if (s_failed) {
         return NAN;
@@ -36,5 +49,13 @@ float die_temp_read(void)
         ESP_LOGW(TAG, "die temperature read failed: %s", esp_err_to_name(err));
         return NAN;
     }
+    return c;
+}
+
+float die_temp_read(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    float c = read_locked();
+    xSemaphoreGive(s_lock);
     return c;
 }

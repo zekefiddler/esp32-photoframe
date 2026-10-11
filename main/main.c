@@ -144,7 +144,8 @@ static int wifi_fail_count_bump(bool reset)
 
 // One more boot that could not associate. Below the threshold this only
 // counts it; at the threshold it erases the credentials and restarts into
-// provisioning (and does not return).
+// provisioning (and does not return). If the erase fails it returns with the
+// count kept, so the next failed boot tries the erase again.
 static void wifi_boot_failed(void)
 {
     int fails = wifi_fail_count_bump(false);
@@ -154,14 +155,27 @@ static void wifi_boot_failed(void)
         return;
     }
     ESP_LOGW(TAG, "Failed to connect to WiFi %d boots in a row - clearing credentials", fails);
-    wifi_fail_count_bump(true);
     nvs_handle_t nvs_handle;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
-        nvs_erase_key(nvs_handle, NVS_WIFI_SSID_KEY);
-        nvs_erase_key(nvs_handle, NVS_WIFI_PASS_KEY);
-        nvs_commit(nvs_handle);
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err == ESP_OK) {
+        esp_err_t e1 = nvs_erase_key(nvs_handle, NVS_WIFI_SSID_KEY);
+        esp_err_t e2 = nvs_erase_key(nvs_handle, NVS_WIFI_PASS_KEY);
+        // A key already gone is as good as erased.
+        err = (e1 == ESP_OK || e1 == ESP_ERR_NVS_NOT_FOUND) ? ESP_OK : e1;
+        if (err == ESP_OK) {
+            err = (e2 == ESP_OK || e2 == ESP_ERR_NVS_NOT_FOUND) ? ESP_OK : e2;
+        }
+        if (err == ESP_OK) {
+            err = nvs_commit(nvs_handle);
+        }
         nvs_close(nvs_handle);
     }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not erase WiFi credentials (%s); keeping the count to retry",
+                 esp_err_to_name(err));
+        return;
+    }
+    wifi_fail_count_bump(true);
     ESP_LOGI(TAG, "Restarting to enter provisioning mode...");
     vTaskDelay(pdMS_TO_TICKS(2000));
     esp_restart();
@@ -349,7 +363,15 @@ void deep_sleep_wake_main(wakeup_source_t wakeup_src)
             ESP_LOGI(TAG, "WiFi connected");
         } else {
             ESP_LOGW(TAG, "WiFi connection timeout");
-            wifi_boot_failed();  // the next cron wake is the retry
+            wifi_boot_failed();
+            if (!config_manager_get_auto_rotate()) {
+                // The normal sleep arms a timer only for auto-rotate, so without
+                // one there would be no next attempt and the count would never
+                // reach provisioning. With auto-rotate on, the next cron wake is
+                // the retry.
+                ESP_LOGW(TAG, "Sleeping %d s before trying again", WIFI_RETRY_SLEEP_SEC);
+                power_manager_enter_sleep_with_timer(WIFI_RETRY_SLEEP_SEC);  // does not return
+            }
         }
     }
 
@@ -735,7 +757,7 @@ void app_main(void)
         // Start mDNS service
         ESP_ERROR_CHECK(mdns_service_init());
     } else {
-        wifi_boot_failed();  // returns only below the threshold
+        wifi_boot_failed();  // returns below the threshold, or if the erase failed
         if (config_manager_get_deep_sleep_enabled()) {
             ESP_LOGW(TAG, "Sleeping %d s before trying again", WIFI_RETRY_SLEEP_SEC);
             power_manager_enter_sleep_with_timer(WIFI_RETRY_SLEEP_SEC);  // does not return
