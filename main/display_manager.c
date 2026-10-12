@@ -196,8 +196,11 @@ esp_err_t display_manager_show_image(const char *filename)
     // It handles: Power On -> Send Data -> Refresh -> Power Off
     ESP_LOGI(TAG, "Calling epaper_display...");
     epaper_display(epd_image_buffer);
-    ESP_LOGI(TAG, "epaper_display returned successfully");
-
+    if (!epaper_display_ok()) {
+        ESP_LOGE(TAG, "e-paper draw failed; %s is not on the glass", filename);
+        xSemaphoreGive(display_mutex);
+        return ESP_FAIL;
+    }
     ESP_LOGI(TAG, "E-paper display update complete");
     ESP_LOGI(TAG, "Free heap after display: %lu bytes", esp_get_free_heap_size());
 
@@ -244,8 +247,11 @@ esp_err_t display_manager_show_rgb_buffer(const uint8_t *rgb_buffer, int width, 
 
     ESP_LOGI(TAG, "Calling epaper_display...");
     epaper_display(epd_image_buffer);
-    ESP_LOGI(TAG, "epaper_display returned successfully");
-
+    if (!epaper_display_ok()) {
+        ESP_LOGE(TAG, "e-paper draw failed");
+        xSemaphoreGive(display_mutex);
+        return ESP_FAIL;
+    }
     ESP_LOGI(TAG, "E-paper display update complete");
     ESP_LOGI(TAG, "Free heap after display: %lu bytes", esp_get_free_heap_size());
 
@@ -415,6 +421,11 @@ esp_err_t display_manager_end_rgb_stream(bool show, const display_publish_t *pub
     if (show) {
         ESP_LOGI(TAG, "Starting e-paper display update (this takes ~30 seconds)");
         epaper_display(epd_image_buffer);
+        if (!epaper_display_ok()) {
+            ESP_LOGE(TAG, "e-paper draw failed; not recording it as displayed");
+            xSemaphoreGive(display_mutex);
+            return ESP_FAIL;
+        }
         ESP_LOGI(TAG, "E-paper display update complete");
 
         const char *record = pub ? pub->display_name : NULL;
@@ -453,6 +464,10 @@ esp_err_t display_manager_clear(void)
 
     epaper_clear(epd_image_buffer, EPD_7IN3E_WHITE);
     epaper_display(epd_image_buffer);
+    if (!epaper_display_ok()) {
+        xSemaphoreGive(display_mutex);
+        return ESP_FAIL;
+    }
 
     // Remove the current image link so API returns 404
     unlink(CURRENT_IMAGE_LINK);
@@ -485,8 +500,13 @@ esp_err_t display_manager_show_calibration(void)
 
     // Display the buffer
     epaper_display(epd_image_buffer);
+    bool drawn = epaper_display_ok();
 
     xSemaphoreGive(display_mutex);
+    if (!drawn) {
+        ESP_LOGE(TAG, "Calibration pattern draw failed");
+        return ESP_FAIL;
+    }
 
     ESP_LOGI(TAG, "Calibration pattern displayed successfully");
     return ESP_OK;

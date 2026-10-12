@@ -374,3 +374,8 @@ void epaper_enter_deepsleep(void)
     }
 #endif
 }
+
+bool epaper_display_ok(void)
+{
+    return true;  // this driver does not report draw faults
+}

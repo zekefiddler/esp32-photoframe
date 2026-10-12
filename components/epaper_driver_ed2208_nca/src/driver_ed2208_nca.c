@@ -6,6 +6,8 @@
 #include <string.h>
 
 #include "driver/gpio.h"
+#include "esp_attr.h"
+#include "esp_timer.h"
 #include "driver/spi_master.h"
 #include "epaper.h"
 #include "esp_log.h"
@@ -120,6 +122,48 @@ static void cmd_data_cs1(uint8_t cmd, const uint8_t *data, size_t len)
 // board's deep sleep and when the controller stops answering (panel_rail_off).
 static bool g_powered = false;
 
+// Did the last epaper_display draw? Callers check it (epaper_display_ok) so a
+// failed draw is not recorded as the picture on the glass.
+static bool g_last_ok = false;
+
+// The rail must stay down long enough to actually reset the controller: cutting
+// it and re-raising it at once (a fault, then the next draw) may never clear one.
+#define RAIL_MIN_OFF_US (1000 * 1000)
+static int64_t g_rail_off_at_us = 0;
+
+// Consecutive draw faults, kept across deep sleep (RTC memory; cleared by a
+// power cycle). After FAULT_LIMIT the panel is not powered again except once
+// every FAULT_RETRY_EVERY attempts, so a broken controller is not re-run
+// through its charge pumps on every wake.
+#define FAULT_LIMIT 2
+#define FAULT_RETRY_EVERY 48
+static RTC_DATA_ATTR uint8_t s_faults = 0;
+static RTC_DATA_ATTR uint8_t s_skipped = 0;
+
+// Hard deadline whenever the rail is up: if a draw hangs (a stuck task, a bus
+// that never frees), this cuts the rail on its own. A healthy draw is ~30-45 s.
+#define RAIL_DEADLINE_US (240LL * 1000 * 1000)
+static esp_timer_handle_t s_deadline = NULL;
+
+static void rail_deadline_cb(void *arg)
+{
+    if (g_cfg.pin_enable >= 0) {
+        gpio_set_level(g_cfg.pin_rst, 0);
+        gpio_set_level(g_cfg.pin_enable, 0);
+    }
+    g_powered = false;
+    g_rail_off_at_us = esp_timer_get_time();
+    ESP_LOGE(TAG, "Panel rail up for %lld s; cut by the deadline", RAIL_DEADLINE_US / 1000000);
+}
+
+static void note_fault(void)
+{
+    if (s_faults < 255) {
+        s_faults++;
+    }
+    ESP_LOGE(TAG, "Panel fault %u of %u before the panel is left unpowered", s_faults, FAULT_LIMIT);
+}
+
 // BUSY limits. The short one is for phases a healthy controller finishes in
 // well under a second, so a stuck line there means a dead or hung controller.
 // The refresh is different: a full refresh of the GDEB0709E01 takes ~45 s on
@@ -194,7 +238,9 @@ static void gpio_init(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&in_conf));
 
     if (g_cfg.pin_enable >= 0) {
-        gpio_hold_dis(g_cfg.pin_enable);
+        // Low and configured as a GPIO output BEFORE the hold is released: on a
+        // wake GPIO43 is still muxed to U0TXD (idle high), so releasing first
+        // would glitch the rail on.
         gpio_set_level(g_cfg.pin_enable, 0);
         gpio_config_t en_conf = {
             .mode = GPIO_MODE_OUTPUT,
@@ -202,6 +248,8 @@ static void gpio_init(void)
         };
         ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&en_conf));
         gpio_set_level(g_cfg.pin_enable, 0);
+        gpio_hold_dis(g_cfg.pin_enable);
+        g_rail_off_at_us = esp_timer_get_time();
         vTaskDelay(pdMS_TO_TICKS(250));  // long enough for the panel's rails to collapse
     }
     g_powered = false;
@@ -220,8 +268,26 @@ static bool panel_power_up(void)
     if (g_powered) {
         return true;
     }
+    if (s_faults >= FAULT_LIMIT) {
+        if (s_skipped < FAULT_RETRY_EVERY) {
+            s_skipped++;
+            ESP_LOGE(TAG, "Panel faulted %u times in a row; leaving it unpowered (%u/%u)", s_faults,
+                     s_skipped, FAULT_RETRY_EVERY);
+            return false;
+        }
+        s_skipped = 0;
+        ESP_LOGW(TAG, "Panel faulted before; trying it once more");
+    }
     if (g_cfg.pin_enable >= 0) {
+        int64_t off_us = esp_timer_get_time() - g_rail_off_at_us;
+        if (off_us >= 0 && off_us < RAIL_MIN_OFF_US) {
+            vTaskDelay(pdMS_TO_TICKS((RAIL_MIN_OFF_US - off_us) / 1000 + 1));
+        }
         gpio_set_level(g_cfg.pin_enable, 1);
+        if (s_deadline) {
+            esp_timer_stop(s_deadline);
+            esp_timer_start_once(s_deadline, RAIL_DEADLINE_US);
+        }
         vTaskDelay(pdMS_TO_TICKS(100));  // allow display power to stabilize
     }
     // Idle levels now the rail is up: deselected, command mode, out of reset.
@@ -233,6 +299,7 @@ static bool panel_power_up(void)
     if (!send_init_sequence()) {
         ESP_LOGE(TAG, "Controller stuck after reset; cutting the panel rail");
         panel_rail_off(false);
+        note_fault();
         return false;
     }
     g_powered = true;
@@ -255,6 +322,7 @@ static void panel_sleep(void)
         // running with the rail held up. Cut it, as for any silent controller.
         ESP_LOGE(TAG, "Controller did not sleep; cutting the panel rail");
         panel_rail_off(false);
+        note_fault();
         return;
     }
     g_powered = false;
@@ -282,6 +350,10 @@ static void panel_rail_off(bool latch)
     }
     vTaskDelay(pdMS_TO_TICKS(100));       // Ensure display enters sleep before cutting power
     gpio_set_level(g_cfg.pin_enable, 0);  // Cut power
+    g_rail_off_at_us = esp_timer_get_time();
+    if (s_deadline) {
+        esp_timer_stop(s_deadline);
+    }
     if (latch) {
         // Latch the pads low so the rail stays cut and panel-facing
         // signals stay grounded once the digital IO domain powers down
@@ -428,6 +500,11 @@ void epaper_init(const epaper_config_t *cfg)
         ESP_LOGE(TAG, "Failed to create PM lock: %s", esp_err_to_name(ret));
     }
 #endif
+
+    if (!s_deadline) {
+        const esp_timer_create_args_t args = {.callback = rail_deadline_cb, .name = "epd_rail"};
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_create(&args, &s_deadline));
+    }
 }
 
 void epaper_clear(uint8_t *image, uint8_t color)
@@ -436,9 +513,9 @@ void epaper_clear(uint8_t *image, uint8_t color)
     uint8_t packed = (c << 4) | c;
     memset(image, packed, EPD_BUF_SIZE);
 
-    ESP_LOGI(TAG, "Clearing display with color 0x%02x", color);
-    epaper_display(image);
-    ESP_LOGI(TAG, "Clear complete");
+    // Fills the buffer only, like the other drivers; the caller draws it. (It
+    // used to draw here too, so display_manager_clear ran the waveform twice.)
+    ESP_LOGI(TAG, "Buffer cleared to color 0x%02x", color);
 }
 
 void epaper_display(uint8_t *image)
@@ -450,9 +527,10 @@ void epaper_display(uint8_t *image)
 #endif
 
     ESP_LOGI(TAG, "Starting display update: %d bytes", EPD_BUF_SIZE);
+    g_last_ok = false;
 
     if (!panel_power_up()) {
-        goto out;  // rail already cut; nothing to talk to
+        goto out;  // refused (fault limit) or rail already cut; nothing to talk to
     }
 
     // CCSET — both controllers
@@ -552,6 +630,18 @@ void epaper_display(uint8_t *image)
 
     ESP_LOGI(TAG, "Display update complete");
     panel_sleep();
+#ifndef CONFIG_EP_ED2208_NCA_KEEP_RAIL_BETWEEN_DRAWS
+    // No reason to keep it up: nothing else shares this bus, so between draws
+    // the panel is unpowered and cannot latch, whatever it did with 0xA5.
+    panel_rail_off(false);
+#else
+    if (s_deadline) {
+        esp_timer_stop(s_deadline);  // asleep by command; the bus needs the rail up
+    }
+#endif
+    g_last_ok = true;
+    s_faults = 0;
+    s_skipped = 0;
     goto out;
 
 fault:
@@ -561,6 +651,7 @@ fault:
     // would not be heard.
     ESP_LOGE(TAG, "Controller not answering; cutting the panel rail");
     panel_rail_off(false);
+    note_fault();
 
 out:
 #ifdef CONFIG_PM_ENABLE
@@ -569,6 +660,11 @@ out:
     }
 #endif
     return;
+}
+
+bool epaper_display_ok(void)
+{
+    return g_last_ok;
 }
 
 void epaper_enter_deepsleep(void)
