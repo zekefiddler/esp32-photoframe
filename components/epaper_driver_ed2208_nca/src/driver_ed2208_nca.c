@@ -1,4 +1,8 @@
 #include <assert.h>
+
+#if CONFIG_EP_ED2208_NCA_PANEL_GDEB0709E01 && !CONFIG_BOARD_DRIVER_GOODDISPLAY_ESP32_133C02
+#error "GDEB0709E01 panel tuning enabled for a board without that panel (stale sdkconfig?)"
+#endif
 #include <string.h>
 
 #include "driver/gpio.h"
