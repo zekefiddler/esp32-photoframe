@@ -52,12 +52,22 @@ static esp_timer_handle_t s_reconnect_timer = NULL;
 static StaticSemaphore_t s_reconnect_lock_buf;
 static SemaphoreHandle_t s_reconnect_lock = NULL;
 
+static void schedule_reconnect(void);
+
 static void reconnect_cb(void *arg)
 {
     xSemaphoreTake(s_reconnect_lock, portMAX_DELAY);
     if (s_auto_reconnect) {
         ESP_LOGI(TAG, "background reconnect attempt");
-        esp_wifi_connect();  // errors (WiFi stopped for sleep, AP-only setup) end the chain
+        esp_err_t err = esp_wifi_connect();
+        if (err == ESP_ERR_WIFI_NOT_STARTED || err == ESP_ERR_WIFI_MODE) {
+            // WiFi stopped for sleep, or AP-only setup mode: the chain ends here.
+        } else if (err != ESP_OK) {
+            // Busy (a scan, a connect in progress): no DISCONNECTED event will
+            // follow to re-arm us, so re-arm here or "never give up" stops.
+            ESP_LOGW(TAG, "reconnect attempt failed (%s); trying again later", esp_err_to_name(err));
+            schedule_reconnect();
+        }
     }
     xSemaphoreGive(s_reconnect_lock);
 }
@@ -281,10 +291,17 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));  // Enable power save at boot/connect
 
     s_retry_num = 0;
+    // Under the reconnect lock, and with any pending background attempt stopped,
+    // so a timer armed for the previous network cannot fire into this connect.
+    xSemaphoreTake(s_reconnect_lock, portMAX_DELAY);
+    if (s_reconnect_timer) {
+        esp_timer_stop(s_reconnect_timer);
+    }
     s_reconnect_ms = RECONNECT_MIN_MS;
     s_auto_reconnect = true;
     s_disconnect_requested = false;
     s_last_reason = 0;
+    xSemaphoreGive(s_reconnect_lock);
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                            pdFALSE, pdFALSE, portMAX_DELAY);
