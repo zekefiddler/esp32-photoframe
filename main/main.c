@@ -148,6 +148,14 @@ static int wifi_fail_count_bump(bool reset)
 // count kept, so the next failed boot tries the erase again.
 static void wifi_boot_failed(void)
 {
+    if (!wifi_manager_last_failure_was_auth()) {
+        // The AP was absent or DHCP never answered: an outage (the Pi or router
+        // is down), not wrong credentials. Never a step toward wiping them, or
+        // a frame left on battery through a long outage would end in setup mode.
+        ESP_LOGW(TAG, "WiFi failed (reason %u): not an auth failure, keeping credentials and count",
+                 wifi_manager_last_disconnect_reason());
+        return;
+    }
     int fails = wifi_fail_count_bump(false);
     if (fails < WIFI_FAILS_BEFORE_PROVISION) {
         ESP_LOGW(TAG, "Failed to connect to WiFi (%d of %d before provisioning); keeping credentials",
@@ -193,7 +201,11 @@ static bool connect_to_wifi_with_timeout(int timeout_seconds)
     char wifi_ssid[WIFI_SSID_MAX_LEN] = {0};
     char wifi_password[WIFI_PASS_MAX_LEN] = {0};
 
-    ESP_ERROR_CHECK(wifi_manager_load_credentials(wifi_ssid, wifi_password));
+    if (wifi_manager_load_credentials(wifi_ssid, wifi_password) != ESP_OK) {
+        // Wiped or never saved: a plain failed connect, not a reason to abort
+        ESP_LOGE(TAG, "No saved WiFi credentials");
+        return false;
+    }
     ESP_LOGI(TAG, "Connecting to WiFi SSID: %s", wifi_ssid);
     wifi_manager_connect(wifi_ssid, wifi_password);
 

@@ -1,6 +1,7 @@
 #ifndef EPAPER_H
 #define EPAPER_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 // Resolution APIs
@@ -43,6 +44,14 @@ void epaper_init(const epaper_config_t *cfg);
  * @param image Pointer to image buffer
  */
 void epaper_display(uint8_t *image);
+
+/**
+ * Whether the last epaper_display drew. False after a controller fault or when
+ * the driver refused to power a panel that keeps faulting, so callers do not
+ * record a picture that never reached the glass. Drivers that cannot tell
+ * return true.
+ */
+bool epaper_display_ok(void);
 
 /**
  * @brief Clear display with specific color

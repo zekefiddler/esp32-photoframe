@@ -30,6 +30,8 @@ static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 static bool s_is_connected = false;
 static esp_netif_t *s_sta_netif = NULL;
+// Reason for the most recent STA disconnect; 0 = none since the last connect().
+static uint8_t s_last_reason = 0;
 
 // Once the quick retries are spent (and WIFI_FAIL_BIT has told any waiting boot
 // path), keep trying in the background. A frame that stays awake on USB power
@@ -84,6 +86,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         // before falling back to the A record.
         esp_netif_create_ip6_linklocal(s_sta_netif);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_last_reason = ((wifi_event_sta_disconnected_t *) event_data)->reason;
         // Same lock as wifi_manager_disconnect(): it posts this event and returns,
         // so there is no deadlock, and a disconnect completing between the check
         // and the connect below can no longer be undone by a retry.
@@ -281,6 +284,7 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
     s_reconnect_ms = RECONNECT_MIN_MS;
     s_auto_reconnect = true;
     s_disconnect_requested = false;
+    s_last_reason = 0;
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                            pdFALSE, pdFALSE, portMAX_DELAY);
@@ -313,6 +317,30 @@ esp_err_t wifi_manager_disconnect(void)
         xSemaphoreGive(s_reconnect_lock);
     }
     return err;
+}
+
+bool wifi_manager_last_failure_was_auth(void)
+{
+    // Only these say the saved credentials are wrong. "No AP found" (the Pi
+    // or router is down), a dropped beacon or a DHCP that never answers are
+    // outages: counting them toward a credential wipe would leave the frame
+    // in setup mode after an ordinary power cut.
+    switch (s_last_reason) {
+    case WIFI_REASON_AUTH_EXPIRE:
+    case WIFI_REASON_MIC_FAILURE:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_802_1X_AUTH_FAILED:
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+uint8_t wifi_manager_last_disconnect_reason(void)
+{
+    return s_last_reason;
 }
 
 bool wifi_manager_is_connected(void)
