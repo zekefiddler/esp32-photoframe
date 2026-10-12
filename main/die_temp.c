@@ -29,7 +29,7 @@ static float read_locked(void)
         return NAN;
     }
     if (s_tsens == NULL) {
-        temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+        temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 100);  // the hot end is what matters
         esp_err_t err = temperature_sensor_install(&cfg, &s_tsens);
         if (err == ESP_OK) {
             err = temperature_sensor_enable(s_tsens);
