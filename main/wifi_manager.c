@@ -5,12 +5,14 @@
 #include "config.h"
 #include "config_manager.h"
 #include "esp_event.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/err.h"
 #include "lwip/sys.h"
@@ -31,6 +33,55 @@ static esp_netif_t *s_sta_netif = NULL;
 // Reason for the most recent STA disconnect; 0 = none since the last connect().
 static uint8_t s_last_reason = 0;
 
+// Once the quick retries are spent (and WIFI_FAIL_BIT has told any waiting boot
+// path), keep trying in the background. A frame that stays awake on USB power
+// never reboots into a fresh connect, so giving up after five quick tries left
+// it off the network for good when its access point blinked for a minute.
+// Cleared by wifi_manager_disconnect() so a deliberate disconnect stays down.
+#define RECONNECT_MIN_MS 5000
+#define RECONNECT_MAX_MS 60000
+static bool s_auto_reconnect = false;
+// Set only by wifi_manager_disconnect(): the event handler then skips the quick
+// retries too. Provisioning drives esp_wifi_* directly and never sets it.
+static bool s_disconnect_requested = false;
+static uint32_t s_reconnect_ms = RECONNECT_MIN_MS;
+static esp_timer_handle_t s_reconnect_timer = NULL;
+// Serialises the timer's check-then-connect with wifi_manager_disconnect():
+// esp_timer_stop() does not wait for a callback already running, so without it
+// a callback could pass the check, then reconnect after the disconnect.
+static StaticSemaphore_t s_reconnect_lock_buf;
+static SemaphoreHandle_t s_reconnect_lock = NULL;
+
+static void schedule_reconnect(void);
+
+static void reconnect_cb(void *arg)
+{
+    xSemaphoreTake(s_reconnect_lock, portMAX_DELAY);
+    if (s_auto_reconnect) {
+        ESP_LOGI(TAG, "background reconnect attempt");
+        esp_err_t err = esp_wifi_connect();
+        if (err == ESP_ERR_WIFI_NOT_STARTED || err == ESP_ERR_WIFI_MODE) {
+            // WiFi stopped for sleep, or AP-only setup mode: the chain ends here.
+        } else if (err != ESP_OK) {
+            // Busy (a scan, a connect in progress): no DISCONNECTED event will
+            // follow to re-arm us, so re-arm here or "never give up" stops.
+            ESP_LOGW(TAG, "reconnect attempt failed (%s); trying again later", esp_err_to_name(err));
+            schedule_reconnect();
+        }
+    }
+    xSemaphoreGive(s_reconnect_lock);
+}
+
+static void schedule_reconnect(void)
+{
+    if (!s_auto_reconnect || !s_reconnect_timer || esp_timer_is_active(s_reconnect_timer)) {
+        return;
+    }
+    esp_timer_start_once(s_reconnect_timer, (uint64_t) s_reconnect_ms * 1000);
+    ESP_LOGI(TAG, "next reconnect in %lu s", (unsigned long) (s_reconnect_ms / 1000));
+    s_reconnect_ms = s_reconnect_ms * 2 > RECONNECT_MAX_MS ? RECONNECT_MAX_MS : s_reconnect_ms * 2;
+}
+
 static void apply_dns_override(void);
 
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id,
@@ -46,15 +97,23 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         esp_netif_create_ip6_linklocal(s_sta_netif);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_last_reason = ((wifi_event_sta_disconnected_t *) event_data)->reason;
-        if (s_retry_num < 5) {
+        // Same lock as wifi_manager_disconnect(): it posts this event and returns,
+        // so there is no deadlock, and a disconnect completing between the check
+        // and the connect below can no longer be undone by a retry.
+        xSemaphoreTake(s_reconnect_lock, portMAX_DELAY);
+        s_is_connected = false;
+        if (s_disconnect_requested) {
+            ESP_LOGI(TAG, "disconnected on request; not reconnecting");
+        } else if (s_retry_num < 5) {
             esp_wifi_connect();
             s_retry_num++;
             ESP_LOGI(TAG, "retry to connect to the AP");
         } else {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            schedule_reconnect();
+            ESP_LOGI(TAG, "connect to the AP fail");
         }
-        s_is_connected = false;
-        ESP_LOGI(TAG, "connect to the AP fail");
+        xSemaphoreGive(s_reconnect_lock);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
@@ -62,6 +121,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         // servers too (#43).
         apply_dns_override();
         s_retry_num = 0;
+        s_reconnect_ms = RECONNECT_MIN_MS;
         s_is_connected = true;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_GOT_IP6) {
@@ -138,6 +198,10 @@ esp_err_t wifi_manager_init(void)
                                                         &event_handler, NULL, &instance_got_ip));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_GOT_IP6, &event_handler,
                                                         NULL, &instance_got_ip6));
+
+    s_reconnect_lock = xSemaphoreCreateMutexStatic(&s_reconnect_lock_buf);
+    const esp_timer_create_args_t reconnect_args = {.callback = reconnect_cb, .name = "wifi_reconn"};
+    ESP_ERROR_CHECK(esp_timer_create(&reconnect_args, &s_reconnect_timer));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     // Don't start WiFi here - let wifi_manager_connect() or wifi_provisioning_start_ap() start it
@@ -227,7 +291,17 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));  // Enable power save at boot/connect
 
     s_retry_num = 0;
+    // Under the reconnect lock, and with any pending background attempt stopped,
+    // so a timer armed for the previous network cannot fire into this connect.
+    xSemaphoreTake(s_reconnect_lock, portMAX_DELAY);
+    if (s_reconnect_timer) {
+        esp_timer_stop(s_reconnect_timer);
+    }
+    s_reconnect_ms = RECONNECT_MIN_MS;
+    s_auto_reconnect = true;
+    s_disconnect_requested = false;
     s_last_reason = 0;
+    xSemaphoreGive(s_reconnect_lock);
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                            pdFALSE, pdFALSE, portMAX_DELAY);
@@ -246,8 +320,20 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *password)
 
 esp_err_t wifi_manager_disconnect(void)
 {
+    if (s_reconnect_lock) {
+        xSemaphoreTake(s_reconnect_lock, portMAX_DELAY);
+    }
+    s_auto_reconnect = false;
+    s_disconnect_requested = true;
+    if (s_reconnect_timer) {
+        esp_timer_stop(s_reconnect_timer);
+    }
     s_is_connected = false;
-    return esp_wifi_disconnect();
+    esp_err_t err = esp_wifi_disconnect();
+    if (s_reconnect_lock) {
+        xSemaphoreGive(s_reconnect_lock);
+    }
+    return err;
 }
 
 bool wifi_manager_last_failure_was_auth(void)
