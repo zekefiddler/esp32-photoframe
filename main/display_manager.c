@@ -463,6 +463,9 @@ esp_err_t display_manager_clear(void)
     }
 
     epaper_clear(epd_image_buffer, EPD_7IN3E_WHITE);
+    // The glass is going white: the next URL fetch must not get a 304 against
+    // the image that was there, or it stays white until the image changes.
+    config_manager_set_image_etag("");
     epaper_display(epd_image_buffer);
     if (!epaper_display_ok()) {
         xSemaphoreGive(display_mutex);
