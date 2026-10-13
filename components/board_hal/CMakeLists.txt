@@ -30,6 +30,8 @@ elseif(CONFIG_BOARD_DRIVER_SEEEDSTUDIO_RETERMINAL_E1003)
     list(APPEND SRCS "src/driver_seeedstudio_reterminal_e1003.c")
 elseif(CONFIG_BOARD_DRIVER_SEEEDSTUDIO_RETERMINAL_E1004)
     list(APPEND SRCS "src/driver_seeedstudio_reterminal_e1004.c")
+elseif(CONFIG_BOARD_DRIVER_GOODDISPLAY_ESP32_133C02)
+    list(APPEND SRCS "src/driver_gooddisplay_esp32_133c02.c")
 endif()
 
 idf_component_register(

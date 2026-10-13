@@ -88,11 +88,24 @@ menu "Board Configuration"
                 The panel rail is gated by a software-controlled load switch.
                 SD card: SPI interface.
 
+        config BOARD_DRIVER_GOODDISPLAY_ESP32_133C02
+            bool "Good Display ESP32-133C02 (7.09\" GDEB0709E01)"
+            select EP_DRIVER_ED2208_NCA
+            select EP_ED2208_NCA_PANEL_GDEB0709E01
+            help
+                Driver for Good Display's ESP32-133C02 driver board carrying the
+                7.09" GDEB0709E01 Spectra 6 panel (1200x1600, dual-CS, same
+                controller family as the 13.3" GDEP133C02).
+                ESP32-S3-WROOM-1 N16R8 with a CH340 USB-UART on UART0: no native
+                USB, so USB power is not detectable; no battery sense; no RTC.
+                Buttons SW2-SW4 are active-high and not wired in yet.
+                SD card: SPI on its own bus, not enabled.
+
     endchoice
 
     config USE_INTERNAL_FLASH_STORAGE
         bool "Use internal flash as storage (LittleFS)"
-        default y if BOARD_DRIVER_SEEEDSTUDIO_XIAO_EE02 || BOARD_DRIVER_SEEEDSTUDIO_XIAO_EE03 || BOARD_DRIVER_SEEEDSTUDIO_XIAO_EE04 || BOARD_DRIVER_SEEEDSTUDIO_RETERMINAL_E1002 || BOARD_DRIVER_SEEEDSTUDIO_RETERMINAL_E1004
+        default y if BOARD_DRIVER_SEEEDSTUDIO_XIAO_EE02 || BOARD_DRIVER_SEEEDSTUDIO_XIAO_EE03 || BOARD_DRIVER_SEEEDSTUDIO_XIAO_EE04 || BOARD_DRIVER_SEEEDSTUDIO_RETERMINAL_E1002 || BOARD_DRIVER_SEEEDSTUDIO_RETERMINAL_E1004 || BOARD_DRIVER_GOODDISPLAY_ESP32_133C02
         default n
         help
             Mounts a LittleFS partition from internal flash to use as storage.

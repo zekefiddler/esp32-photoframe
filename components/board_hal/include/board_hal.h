@@ -24,6 +24,7 @@ typedef enum {
     BOARD_TYPE_SEEEDSTUDIO_RETERMINAL_E1002,
     BOARD_TYPE_SEEEDSTUDIO_RETERMINAL_E1003,
     BOARD_TYPE_SEEEDSTUDIO_RETERMINAL_E1004,
+    BOARD_TYPE_GOODDISPLAY_ESP32_133C02,
     BOARD_TYPE_UNKNOWN
 } board_type_t;
 
@@ -41,6 +42,8 @@ typedef enum {
 #include "board_seeedstudio_reterminal_e1003.h"
 #elif defined(CONFIG_BOARD_DRIVER_SEEEDSTUDIO_RETERMINAL_E1004)
 #include "board_seeedstudio_reterminal_e1004.h"
+#elif defined(CONFIG_BOARD_DRIVER_GOODDISPLAY_ESP32_133C02)
+#include "board_gooddisplay_esp32_133c02.h"
 #else
 // Default definitions if no board selected (fallback)
 #error "No board selected! Please define CONFIG_BOARD_DRIVER_..."
