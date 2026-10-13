@@ -489,6 +489,7 @@ esp_err_t display_manager_show_calibration(void)
     }
 
     ESP_LOGI(TAG, "Displaying calibration pattern");
+    config_manager_set_image_etag("");  // the glass will not show the fetched image
 
     // Re-initialize paint with current orientation
     display_manager_initialize_paint();
