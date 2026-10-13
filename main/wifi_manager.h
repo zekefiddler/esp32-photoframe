@@ -2,6 +2,7 @@
 #define WIFI_MANAGER_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 #include "esp_wifi.h"
@@ -25,6 +26,11 @@ esp_err_t wifi_manager_apply_ip_config(void);
 esp_err_t wifi_manager_connect(const char *ssid, const char *password);
 esp_err_t wifi_manager_disconnect(void);
 bool wifi_manager_is_connected(void);
+
+// True when the last disconnect was an authentication failure (wrong password),
+// as opposed to an absent AP or a DHCP that never answered.
+bool wifi_manager_last_failure_was_auth(void);
+uint8_t wifi_manager_last_disconnect_reason(void);
 esp_err_t wifi_manager_get_ip(char *ip_str, size_t len);
 esp_err_t wifi_manager_save_credentials(const char *ssid, const char *password);
 esp_err_t wifi_manager_load_credentials(char *ssid, char *password);

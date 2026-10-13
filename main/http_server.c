@@ -1,4 +1,6 @@
 #include "http_server.h"
+#include <math.h>
+#include "die_temp.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -1885,6 +1887,12 @@ static esp_err_t system_info_handler(httpd_req_t *req)
     cJSON_AddStringToObject(response, "compile_time", app_desc->time);
     cJSON_AddStringToObject(response, "compile_date", app_desc->date);
     cJSON_AddStringToObject(response, "idf_version", app_desc->idf_ver);
+    float die_c = die_temp_read();
+    if (isnan(die_c)) {
+        cJSON_AddNullToObject(response, "die_temp_c");
+    } else {
+        cJSON_AddNumberToObject(response, "die_temp_c", die_c);
+    }
 
     char *json_str = cJSON_Print(response);
     httpd_resp_set_type(req, "application/json");

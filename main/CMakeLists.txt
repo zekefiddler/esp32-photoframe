@@ -4,6 +4,7 @@ set(SOURCES
     "color_palette.c"
     "config_manager.c"
     "debug_log.c"
+    "die_temp.c"
     "display_flow.c"
     "display_manager.c"
     "dns_server.c"
@@ -28,6 +29,7 @@ set(SOURCES
 set(INCLUDE_DIRS ".")
 
 set(PRIV_REQUIRES
+    esp_driver_tsens
     app_update
     board_hal
     espressif__qrcode

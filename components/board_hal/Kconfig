@@ -81,6 +81,7 @@ menu "Board Configuration"
             select SENSOR_DRIVER_SHT40
             select RTC_DRIVER_PCF8563
             select EP_DRIVER_ED2208_NCA
+            select EP_ED2208_NCA_KEEP_RAIL_BETWEEN_DRAWS
             help
                 Driver for Seeed reTerminal E1004 with 13.3" Spectra 6 display
                 (1200x1600, dual-CS ED2208-NCA panel).

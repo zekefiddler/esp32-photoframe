@@ -16,3 +16,12 @@ config EP_ED2208_NCA_PANEL_GDEB0709E01
         different PSR, analog timing, booster, DRF and POF values, plus the
         DCDC, PLL, per-controller POFS and CMDA4 commands the vendor init sends.
         Same controller family and command flow; only the parameters change.
+
+config EP_ED2208_NCA_KEEP_RAIL_BETWEEN_DRAWS
+    # Selected by boards whose panel shares its SPI bus (the reTerminal E1004's
+    # SD card): clocking that bus into an unpowered controller back-feeds it
+    # through its ESD diodes, so the rail stays up and the controller sleeps by
+    # command. Everyone else cuts the rail after every draw.
+    bool
+    depends on EP_DRIVER_ED2208_NCA
+    default n

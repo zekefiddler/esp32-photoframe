@@ -548,3 +548,8 @@ uint16_t epaper_get_height(void)
 {
     return s_dev.panel_h;
 }
+
+bool epaper_display_ok(void)
+{
+    return true;  // this driver does not report draw faults
+}

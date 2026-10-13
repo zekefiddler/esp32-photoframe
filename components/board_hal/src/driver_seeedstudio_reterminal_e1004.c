@@ -110,8 +110,9 @@ esp_err_t board_hal_init(void)
         .pin_busy = BOARD_HAL_EPD_BUSY_PIN,
         .pin_cs1 = BOARD_HAL_EPD_CS1_PIN,
         // SCREEN_EN# drives an active-high load switch for the panel's 3V3
-        // rail. The ED2208 NCA driver enables it on init and cuts it (with a
-        // deep-sleep pad hold) in epaper_enter_deepsleep().
+        // rail. The ED2208 NCA driver holds it off briefly at init, raises it
+        // for the first draw, and cuts it (with a deep-sleep pad hold) in
+        // epaper_enter_deepsleep() or when the controller stops answering.
         .pin_enable = BOARD_HAL_EPD_ENABLE_PIN,
     };
     epaper_init(&ep_cfg);

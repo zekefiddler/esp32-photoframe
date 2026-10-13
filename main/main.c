@@ -37,6 +37,7 @@
 #include "ota_manager.h"
 #include "periodic_tasks.h"
 #include "power_manager.h"
+#include "die_temp.h"
 #include "processing_settings.h"
 #include "splash_screen.h"
 #include "storage.h"
@@ -115,13 +116,96 @@ static esp_err_t sntp_sync_periodic_callback(void)
     return ESP_OK;
 }
 
+// Consecutive boots that failed to associate, kept in NVS so they survive the
+// restart or sleep between attempts. See WIFI_FAILS_BEFORE_PROVISION.
+static int wifi_fail_count_bump(bool reset)
+{
+    nvs_handle_t h;
+    int32_t n = 0;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "wifi_fails: nvs_open failed: %s", esp_err_to_name(err));
+        return reset ? 0 : 1;
+    }
+    nvs_get_i32(h, NVS_WIFI_FAILS_KEY, &n);  // missing key leaves n at 0
+    int32_t next = reset ? 0 : n + 1;
+    if (next != n) {  // no flash write when nothing changed
+        err = nvs_set_i32(h, NVS_WIFI_FAILS_KEY, next);
+        if (err == ESP_OK) {
+            err = nvs_commit(h);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "wifi_fails: write failed: %s", esp_err_to_name(err));
+        }
+    }
+    nvs_close(h);
+    return (int) next;
+}
+
+// One more boot that could not associate. Below the threshold this only
+// counts it; at the threshold it erases the credentials and restarts into
+// provisioning (and does not return). If the erase fails it returns with the
+// count kept, so the next failed boot tries the erase again.
+static void wifi_boot_failed(void)
+{
+    if (!wifi_manager_last_failure_was_auth()) {
+        // The AP was absent or DHCP never answered: an outage (the Pi or router
+        // is down), not wrong credentials. Never a step toward wiping them, or
+        // a frame left on battery through a long outage would end in setup mode.
+        ESP_LOGW(TAG, "WiFi failed (reason %u): not an auth failure, keeping credentials and count",
+                 wifi_manager_last_disconnect_reason());
+        return;
+    }
+    int fails = wifi_fail_count_bump(false);
+    if (fails < WIFI_FAILS_BEFORE_PROVISION) {
+        ESP_LOGW(TAG, "Failed to connect to WiFi (%d of %d before provisioning); keeping credentials",
+                 fails, WIFI_FAILS_BEFORE_PROVISION);
+        return;
+    }
+    ESP_LOGW(TAG, "Failed to connect to WiFi %d boots in a row - clearing credentials", fails);
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err == ESP_OK) {
+        esp_err_t e1 = nvs_erase_key(nvs_handle, NVS_WIFI_SSID_KEY);
+        esp_err_t e2 = nvs_erase_key(nvs_handle, NVS_WIFI_PASS_KEY);
+        // A key already gone is as good as erased.
+        err = (e1 == ESP_OK || e1 == ESP_ERR_NVS_NOT_FOUND) ? ESP_OK : e1;
+        if (err == ESP_OK) {
+            err = (e2 == ESP_OK || e2 == ESP_ERR_NVS_NOT_FOUND) ? ESP_OK : e2;
+        }
+        if (err == ESP_OK) {
+            err = nvs_commit(nvs_handle);
+        }
+        nvs_close(nvs_handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not erase WiFi credentials (%s); keeping the count to retry",
+                 esp_err_to_name(err));
+        return;
+    }
+    // On SD-card boards the next boot would re-import the same credentials
+    // from wifi.txt and never reach the setup AP; retire the file too.
+    if (!storage_reject_wifi_credentials()) {
+        ESP_LOGE(TAG, "wifi.txt still in place; keeping the count to retry");
+        return;
+    }
+    wifi_fail_count_bump(true);
+    ESP_LOGI(TAG, "Restarting to enter provisioning mode...");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_restart();
+}
+
 // Helper function to connect to WiFi with timeout
 static bool connect_to_wifi_with_timeout(int timeout_seconds)
 {
     char wifi_ssid[WIFI_SSID_MAX_LEN] = {0};
     char wifi_password[WIFI_PASS_MAX_LEN] = {0};
 
-    ESP_ERROR_CHECK(wifi_manager_load_credentials(wifi_ssid, wifi_password));
+    if (wifi_manager_load_credentials(wifi_ssid, wifi_password) != ESP_OK) {
+        // Wiped or never saved: a plain failed connect, not a reason to abort
+        ESP_LOGE(TAG, "No saved WiFi credentials");
+        return false;
+    }
     ESP_LOGI(TAG, "Connecting to WiFi SSID: %s", wifi_ssid);
     wifi_manager_connect(wifi_ssid, wifi_password);
 
@@ -293,9 +377,19 @@ void deep_sleep_wake_main(wakeup_source_t wakeup_src)
 
         if (connect_to_wifi_with_timeout(60)) {
             wifi_connected = true;
+            wifi_fail_count_bump(true);
             ESP_LOGI(TAG, "WiFi connected");
         } else {
             ESP_LOGW(TAG, "WiFi connection timeout");
+            wifi_boot_failed();
+            if (!config_manager_get_auto_rotate()) {
+                // The normal sleep arms a timer only for auto-rotate, so without
+                // one there would be no next attempt and the count would never
+                // reach provisioning. With auto-rotate on, the next cron wake is
+                // the retry.
+                ESP_LOGW(TAG, "Sleeping %d s before trying again", WIFI_RETRY_SLEEP_SEC);
+                power_manager_enter_sleep_with_timer(WIFI_RETRY_SLEEP_SEC);  // does not return
+            }
         }
     }
 
@@ -671,6 +765,7 @@ void app_main(void)
     }
 
     if (connect_to_wifi_with_timeout(30)) {
+        wifi_fail_count_bump(true);
         // Check and run periodic tasks (OTA check, SNTP sync if due)
         // Note: If RTC was invalid at boot, sntp_sync was already forced via
         // periodic_tasks_force_run()
@@ -680,16 +775,13 @@ void app_main(void)
         // Start mDNS service
         ESP_ERROR_CHECK(mdns_service_init());
     } else {
-        ESP_LOGW(TAG, "Failed to connect to WiFi - clearing credentials");
-        nvs_handle_t nvs_handle;
-        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
-            nvs_erase_key(nvs_handle, NVS_WIFI_SSID_KEY);
-            nvs_erase_key(nvs_handle, NVS_WIFI_PASS_KEY);
-            nvs_commit(nvs_handle);
-            nvs_close(nvs_handle);
+        wifi_boot_failed();  // returns below the threshold, or if the erase failed
+        if (config_manager_get_deep_sleep_enabled()) {
+            ESP_LOGW(TAG, "Sleeping %d s before trying again", WIFI_RETRY_SLEEP_SEC);
+            power_manager_enter_sleep_with_timer(WIFI_RETRY_SLEEP_SEC);  // does not return
         }
-        ESP_LOGI(TAG, "Restarting to enter provisioning mode...");
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        ESP_LOGW(TAG, "Waiting %d s before trying again", WIFI_RETRY_AWAKE_SEC);
+        vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_AWAKE_SEC * 1000));
         esp_restart();
     }
 
@@ -734,6 +826,7 @@ void app_main(void)
     ha_notify_online(NULL);
 
     ESP_LOGI(TAG, "PhotoFrame started successfully");
+    ESP_LOGI(TAG, "Die temperature: %.1f C", die_temp_read());
 
     // Delay OTA check to avoid competing with boot-time network activity
     vTaskDelay(pdMS_TO_TICKS(10000));
