@@ -5,6 +5,7 @@
 #include <zlib.h>
 
 #include "board_hal.h"
+#include "config_manager.h"
 #include "epaper.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -162,6 +163,10 @@ static esp_err_t decompress_gzip(const uint8_t *compressed, size_t compressed_si
 
 esp_err_t splash_screen_display(void)
 {
+    // The glass will no longer show the last fetched image. Forget its ETag, or
+    // the next URL fetch gets a 304 and this screen stays up until the server's
+    // image changes (after a WiFi recovery: a QR code, possibly for good).
+    config_manager_set_image_etag("");
     int width = BOARD_HAL_DISPLAY_WIDTH;
     int height = BOARD_HAL_DISPLAY_HEIGHT;
     int buf_size = ((width + 1) / 2) * height;
@@ -231,6 +236,7 @@ esp_err_t splash_screen_display(void)
 
 esp_err_t splash_screen_display_setup_complete(const char *hostname)
 {
+    config_manager_set_image_etag("");  // see splash_screen_display()
     int width = BOARD_HAL_DISPLAY_WIDTH;
     int height = BOARD_HAL_DISPLAY_HEIGHT;
     int buf_size = ((width + 1) / 2) * height;

@@ -1230,6 +1230,10 @@ esp_err_t trigger_image_rotation(void)
         } else {
             ESP_LOGE(TAG,
                      "Failed to fetch and display image from URL, falling back to local rotation");
+            // The ETag was stored on the 200, before the display (or is the old
+            // one, if the download failed); either way the glass will not show
+            // that image. Forget it, or every later fetch 304s against it.
+            config_manager_set_image_etag("");
             display_manager_rotate_from_storage();
             result = ESP_FAIL;
         }

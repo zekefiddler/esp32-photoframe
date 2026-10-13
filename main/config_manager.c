@@ -1015,14 +1015,25 @@ void config_manager_set_image_etag(const char *etag)
     image_etag[HTTP_ETAG_MAX_LEN - 1] = '\0';
 
     nvs_handle_t nvs_handle;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err == ESP_OK) {
         if (image_etag[0] != '\0') {
-            nvs_set_str(nvs_handle, NVS_IMAGE_ETAG_KEY, image_etag);
+            err = nvs_set_str(nvs_handle, NVS_IMAGE_ETAG_KEY, image_etag);
         } else {
-            nvs_erase_key(nvs_handle, NVS_IMAGE_ETAG_KEY);
+            err = nvs_erase_key(nvs_handle, NVS_IMAGE_ETAG_KEY);
+            if (err == ESP_ERR_NVS_NOT_FOUND) {
+                err = ESP_OK;  // already gone
+            }
         }
-        nvs_commit(nvs_handle);
+        if (err == ESP_OK) {
+            err = nvs_commit(nvs_handle);
+        }
         nvs_close(nvs_handle);
+    }
+    if (err != ESP_OK) {
+        // RAM holds the new value but NVS the old one, so after deep sleep the
+        // stale ETag returns. Rare; log it so the 304s that follow are explainable.
+        ESP_LOGE(TAG, "Failed to persist image ETag: %s", esp_err_to_name(err));
     }
 }
 
